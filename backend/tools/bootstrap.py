@@ -1,3 +1,5 @@
+import logging
+
 from langchain_core.tools import BaseTool
 
 from backend.app.core.config import AppSettings

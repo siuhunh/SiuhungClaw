@@ -58,10 +58,24 @@ class VectorDBSettings:
 
 
 @dataclass
+class MemorySettings:
+    """Session-scoped short-term window + periodic long-term extraction."""
+
+    short_term_messages: int = 24
+    long_term_enabled: bool = True
+    long_term_every_n_user_turns: int = 2
+    extraction_context_messages: int = 28
+    max_long_term_bullets: int = 80
+    vector_recall_long_k: int = 4
+    vector_recall_short_k: int = 4
+
+
+@dataclass
 class AppSettings:
     llm: LLMSettings
     embedding: EmbeddingSettings
     vectordb: VectorDBSettings
+    memory: MemorySettings
 
 
 def ensure_runtime_dirs() -> None:
@@ -162,6 +176,15 @@ def _from_env() -> dict[str, Any]:
             "top_k": os.getenv("VECTOR_MEMORY_TOP_K", ""),
             "metric_type": os.getenv("MILVUS_METRIC_TYPE", ""),
         },
+        "memory": {
+            "short_term_messages": os.getenv("MEMORY_SHORT_TERM_MESSAGES", ""),
+            "long_term_enabled": os.getenv("MEMORY_LONG_TERM_ENABLED", ""),
+            "long_term_every_n_user_turns": os.getenv("MEMORY_LONG_TERM_EVERY_N_USER_TURNS", ""),
+            "extraction_context_messages": os.getenv("MEMORY_EXTRACTION_CONTEXT_MESSAGES", ""),
+            "max_long_term_bullets": os.getenv("MEMORY_MAX_LONG_TERM_BULLETS", ""),
+            "vector_recall_long_k": os.getenv("MEMORY_VECTOR_RECALL_LONG_K", ""),
+            "vector_recall_short_k": os.getenv("MEMORY_VECTOR_RECALL_SHORT_K", ""),
+        },
     }
     return env
 
@@ -196,6 +219,15 @@ def get_settings() -> AppSettings:
             "top_k": 5,
             "metric_type": "COSINE",
         },
+        "memory": {
+            "short_term_messages": 24,
+            "long_term_enabled": True,
+            "long_term_every_n_user_turns": 2,
+            "extraction_context_messages": 28,
+            "max_long_term_bullets": 80,
+            "vector_recall_long_k": 4,
+            "vector_recall_short_k": 4,
+        },
     }
 
     merged = _deep_merge(defaults, _from_file())
@@ -204,6 +236,7 @@ def get_settings() -> AppSettings:
     llm_map = merged["llm"]
     emb_map = merged["embedding"]
     vdb_map = merged["vectordb"]
+    mem_map = merged.get("memory") or {}
 
     llm = LLMSettings(
         provider=llm_map.get("provider") or "deepseek",
@@ -232,4 +265,33 @@ def get_settings() -> AppSettings:
         top_k=int(vdb_map.get("top_k") or 5),
         metric_type=str(vdb_map.get("metric_type") or "COSINE"),
     )
-    return AppSettings(llm=llm, embedding=embedding, vectordb=vectordb)
+
+    def _mem_int(key: str, default: int) -> int:
+        v = mem_map.get(key)
+        if v is None or v == "":
+            return default
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _mem_bool(key: str, default: bool) -> bool:
+        v = mem_map.get(key)
+        if v is None or v == "":
+            return default
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
+    memory = MemorySettings(
+        short_term_messages=max(0, _mem_int("short_term_messages", 24)),
+        long_term_enabled=_mem_bool("long_term_enabled", True),
+        long_term_every_n_user_turns=max(0, _mem_int("long_term_every_n_user_turns", 2)),
+        extraction_context_messages=max(0, _mem_int("extraction_context_messages", 28)),
+        max_long_term_bullets=max(1, _mem_int("max_long_term_bullets", 80)),
+        vector_recall_long_k=max(0, _mem_int("vector_recall_long_k", 4)),
+        vector_recall_short_k=max(0, _mem_int("vector_recall_short_k", 4)),
+    )
+    return AppSettings(llm=llm, embedding=embedding, vectordb=vectordb, memory=memory)

@@ -18,10 +18,15 @@ class MilvusVectorMemoryStore:
         self._connected = False
         self._collection = None
         self._pymilvus = None
+        self._has_memory_kind = False
 
     @property
     def enabled(self) -> bool:
         return self._cfg.enabled and self._cfg.provider.lower() == "milvus"
+
+    @property
+    def supports_memory_kinds(self) -> bool:
+        return self._has_memory_kind
 
     def initialize(self) -> None:
         if not self.enabled:
@@ -66,8 +71,17 @@ class MilvusVectorMemoryStore:
             utility_mod = self._pymilvus["utility"]
             if utility_mod.has_collection(collection_name, using="aceclaw_milvus"):
                 collection = Collection(collection_name, using="aceclaw_milvus")
+                field_names = {f.name for f in collection.schema.fields}
+                self._has_memory_kind = "memory_kind" in field_names
+                if not self._has_memory_kind:
+                    logger.warning(
+                        "milvus collection %s has no memory_kind field; using legacy inserts/search. "
+                        "Drop the collection or use a new MILVUS_COLLECTION_NAME for short/long split.",
+                        collection_name,
+                    )
             else:
                 collection = self._create_collection(collection_name)
+                self._has_memory_kind = True
             self._collection = collection
             self._collection.load()
             self._connected = True
@@ -87,10 +101,11 @@ class MilvusVectorMemoryStore:
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="session_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="ts", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="memory_kind", dtype=DataType.VARCHAR, max_length=16),
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=8192),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self._cfg.embedding_dim),
         ]
-        schema = CollectionSchema(fields=fields, description="AceClaw conversation memories")
+        schema = CollectionSchema(fields=fields, description="AceClaw conversation memories (short/long)")
         collection = Collection(
             name=collection_name,
             schema=schema,
@@ -124,39 +139,74 @@ class MilvusVectorMemoryStore:
         raise RuntimeError("embedding model does not support query embeddings")
 
     def remember_turn(self, session_id: str, user_message: str, assistant_message: str) -> None:
-        if not self._connected or self._collection is None:
-            return
         ts = datetime.now(timezone.utc).isoformat()
         text = f"user: {user_message}\nassistant: {assistant_message}"
+        self.remember_text(session_id, text, ts=ts, memory_kind="short")
+
+    def remember_long_fact(self, session_id: str, fact: str) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        self.remember_text(session_id, fact, ts=ts, memory_kind="long")
+
+    def remember_text(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        ts: str | None = None,
+        memory_kind: str = "short",
+    ) -> None:
+        if not self._connected or self._collection is None:
+            return
+        stamp = ts or datetime.now(timezone.utc).isoformat()
         if len(text) > 8000:
             text = text[:8000]
+        kind = (memory_kind or "short")[:16]
         try:
             vec = self._embed_query(text)
-            self._collection.insert(
-                [
-                    [session_id],
-                    [ts],
-                    [text],
-                    [vec],
-                ]
-            )
+            if self._has_memory_kind:
+                self._collection.insert(
+                    [
+                        [session_id],
+                        [stamp],
+                        [kind],
+                        [text],
+                        [vec],
+                    ]
+                )
+            else:
+                self._collection.insert([[session_id], [stamp], [text], [vec]])
         except Exception as e:
-            logger.warning("milvus remember_turn failed: %s", e)
+            logger.warning("milvus remember_text failed: %s", e)
 
-    def search(self, session_id: str, query: str) -> list[str]:
+    def search(
+        self,
+        session_id: str,
+        query: str,
+        *,
+        memory_kinds: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
         if not self._connected or self._collection is None:
             return []
         if not query.strip():
             return []
+        lim = limit if limit is not None else max(1, self._cfg.top_k)
         try:
             vec = self._embed_query(query)
+            if self._has_memory_kind and memory_kinds:
+                kinds = [k[:16] for k in memory_kinds if k]
+                kind_expr = " or ".join(f'memory_kind == "{k}"' for k in kinds)
+                expr = f'session_id == "{session_id}" and ({kind_expr})'
+            else:
+                expr = f'session_id == "{session_id}"'
+            out_fields = ["text", "ts", "memory_kind"] if self._has_memory_kind else ["text", "ts"]
             results = self._collection.search(
                 data=[vec],
                 anns_field="embedding",
                 param={"metric_type": self._cfg.metric_type, "params": {"nprobe": 10}},
-                limit=max(1, self._cfg.top_k),
-                expr=f'session_id == "{session_id}"',
-                output_fields=["text", "ts"],
+                limit=max(1, lim),
+                expr=expr,
+                output_fields=out_fields,
             )
             out: list[str] = []
             if results:
@@ -164,8 +214,12 @@ class MilvusVectorMemoryStore:
                     ent = hit.entity
                     text = ent.get("text") if ent else ""
                     ts = ent.get("ts") if ent else ""
+                    mk = ent.get("memory_kind", "") if ent else ""
                     if text:
-                        out.append(f"[{ts}] {text}")
+                        if mk:
+                            out.append(f"[{mk}][{ts}] {text}")
+                        else:
+                            out.append(f"[{ts}] {text}")
             return out
         except Exception as e:
             logger.warning("milvus search failed: %s", e)

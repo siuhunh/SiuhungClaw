@@ -1,3 +1,15 @@
+"""
+RAG 检索优化要点（业界常见做法，在代码中落地）：
+
+1. **统一分块**：向量索引与 BM25 使用同一批 `nodes`，避免「向量按整篇、关键词按段」的错位。
+2. **分块尺寸与重叠**：较大 chunk + overlap 提升语义完整度；overlap 降低边界截断损失。
+3. **提高召回再截断**：vector / BM25 略提高 top_k，融合后再按条数与字数截断，减少漏检。
+4. **纯 BM25 路径**：长文档按段落滑窗切块并带 `路径#partN` 伪文档 id，避免整篇仅一个稀疏向量词袋。
+5. **索引失效**：若增删 `storage/knowledge/` 后检索异常，删除 `storage/index/knowledge/` 后重启以全量重建向量索引。
+
+可选后续（未内置）：Cross-Encoder 重排、HyDE、多查询 LLM 扩展、Markdown 结构感知解析、查询改写。
+"""
+
 import logging
 from typing import Any, Callable
 
@@ -6,6 +18,42 @@ from langchain_core.tools import BaseTool
 from backend.app.core.config import INDEX_DIR, KNOWLEDGE_DIR
 
 logger = logging.getLogger(__name__)
+
+# --- 可调参数（与业界默认取向一致：偏召回、再靠融合与上下文长度截断） ---
+RAG_CHUNK_SIZE = 1024
+RAG_CHUNK_OVERLAP = 160
+RAG_VECTOR_TOP_K = 8
+RAG_BM25_TOP_K = 8
+RAG_FUSION_OUTPUT_NODES = 12
+RAG_SNIPPET_CHARS = 2000
+RAG_BM25_PARAGRAPH_MAX_CHARS = 1600
+
+
+def _paragraph_chunks(text: str, max_chars: int) -> list[str]:
+    """按空行分段再合并，避免 BM25 把整本书当一条稀疏文档。"""
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not parts:
+        return [text[:max_chars]] if text.strip() else []
+    chunks: list[str] = []
+    buf = ""
+    for p in parts:
+        if len(buf) + len(p) + 2 <= max_chars:
+            buf = f"{buf}\n\n{p}" if buf else p
+        else:
+            if buf:
+                chunks.append(buf)
+            if len(p) <= max_chars:
+                buf = p
+            else:
+                for i in range(0, len(p), max_chars):
+                    chunks.append(p[i : i + max_chars])
+                buf = ""
+        while len(buf) > max_chars:
+            chunks.append(buf[:max_chars])
+            buf = buf[max_chars:].lstrip()
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 def _collect_text_docs() -> list[tuple[str, str]]:
@@ -16,7 +64,13 @@ def _collect_text_docs() -> list[tuple[str, str]]:
         for path in KNOWLEDGE_DIR.rglob(ext):
             if path.is_file():
                 try:
-                    pairs.append((str(path.relative_to(KNOWLEDGE_DIR)), path.read_text(encoding="utf-8", errors="ignore")))
+                    rel = str(path.relative_to(KNOWLEDGE_DIR))
+                    body = path.read_text(encoding="utf-8", errors="ignore")
+                    if len(body) <= RAG_BM25_PARAGRAPH_MAX_CHARS:
+                        pairs.append((rel, body))
+                    else:
+                        for i, ch in enumerate(_paragraph_chunks(body, RAG_BM25_PARAGRAPH_MAX_CHARS)):
+                            pairs.append((f"{rel}#part{i}", ch))
                 except OSError:
                     continue
     return pairs
@@ -44,13 +98,13 @@ def _bm25_search_factory() -> Callable[[str], str]:
         if not q:
             return "Empty query."
         scores = bm25.get_scores(q)
-        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:6]
+        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:10]
         chunks: list[str] = []
         for i in ranked:
             if scores[i] <= 0:
                 continue
             rel, body = pairs[i]
-            chunks.append(f"### {rel} (score={scores[i]:.3f})\n{body[:1200]}")
+            chunks.append(f"### {rel} (score={scores[i]:.3f})\n{body[:RAG_SNIPPET_CHARS]}")
         return "\n\n".join(chunks) if chunks else "No BM25 hits."
 
     return search
@@ -100,28 +154,47 @@ def _try_build_llama_hybrid(settings: Any) -> Callable[[str], str] | None:
         if not documents:
             return lambda q: "No loadable documents in storage/knowledge/."
 
+        splitter = SentenceSplitter(
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        nodes = splitter.get_nodes_from_documents(documents)
+        if not nodes:
+            return lambda q: "No chunks after splitting; check storage/knowledge/."
+
         index: VectorStoreIndex
         try:
             if INDEX_DIR.exists() and any(INDEX_DIR.iterdir()):
                 storage_context = StorageContext.from_defaults(persist_dir=persist)
                 index = load_index_from_storage(storage_context)
+                logger.info(
+                    "RAG: loaded vector index from %s (if knowledge files changed, delete this dir to rebuild).",
+                    persist,
+                )
             else:
                 raise FileNotFoundError("no index")
         except Exception:
             sc = StorageContext.from_defaults()
-            index = VectorStoreIndex.from_documents(documents, storage_context=sc)
+            # 与 BM25 共用同一 nodes，保证向量通道与关键词通道块对齐
+            index = VectorStoreIndex(nodes, storage_context=sc, show_progress=False)
             index.storage_context.persist(persist_dir=persist)
+            logger.info(
+                "RAG: built new vector index (%s chunks) under %s",
+                len(nodes),
+                persist,
+            )
 
-        splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
-        nodes = splitter.get_nodes_from_documents(documents)
-        vector_retriever = index.as_retriever(similarity_top_k=4)
+        vector_retriever = index.as_retriever(similarity_top_k=RAG_VECTOR_TOP_K)
         bm25_retriever = None
         try:
-            bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=4)
+            bm25_retriever = BM25Retriever.from_defaults(
+                nodes=nodes,
+                similarity_top_k=RAG_BM25_TOP_K,
+            )
         except Exception as e:
             logger.warning("BM25Retriever init failed: %s", e)
 
-        qe = index.as_query_engine(similarity_top_k=6)
+        qe = index.as_query_engine(similarity_top_k=max(RAG_VECTOR_TOP_K, 6))
 
         def search_qe(query: str) -> str:
             return str(qe.query(query))
@@ -139,8 +212,8 @@ def _try_build_llama_hybrid(settings: Any) -> Callable[[str], str] | None:
             def search_fusion(query: str) -> str:
                 nodes_out = fusion.retrieve(query)
                 parts = []
-                for n in nodes_out[:8]:
-                    parts.append(n.get_content()[:1800])
+                for n in nodes_out[:RAG_FUSION_OUTPUT_NODES]:
+                    parts.append(n.get_content()[:RAG_SNIPPET_CHARS])
                 return "\n\n---\n\n".join(parts) if parts else "No retrieval results."
 
             return search_fusion

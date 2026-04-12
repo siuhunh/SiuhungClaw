@@ -3,6 +3,7 @@ from collections.abc import AsyncGenerator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from backend.app.core.config import get_settings
 from backend.app.core.model_factory import get_chat_model
 from backend.app.services.system_prompt import build_system_prompt
 from backend.app.services.vector_memory import get_vector_memory
@@ -46,10 +47,39 @@ class AgentRuntime:
         store = get_vector_memory()
         if store is None or not store.enabled:
             return base
-        recalled = store.search(session_id=session_id, query=user_message)
-        if not recalled:
+        mem = get_settings().memory
+        sections: list[str] = []
+        if store.supports_memory_kinds:
+            if mem.vector_recall_long_k > 0:
+                long_hits = store.search(
+                    session_id,
+                    user_message,
+                    memory_kinds=["long"],
+                    limit=mem.vector_recall_long_k,
+                )
+                if long_hits:
+                    sections.append(
+                        "**Long-term (vector):**\n" + "\n".join(f"- {x}" for x in long_hits)
+                    )
+            if mem.vector_recall_short_k > 0:
+                short_hits = store.search(
+                    session_id,
+                    user_message,
+                    memory_kinds=["short"],
+                    limit=mem.vector_recall_short_k,
+                )
+                if short_hits:
+                    sections.append(
+                        "**Short-term turns (vector):**\n" + "\n".join(f"- {x}" for x in short_hits)
+                    )
+        else:
+            lim = max(1, mem.vector_recall_long_k + mem.vector_recall_short_k)
+            recalled = store.search(session_id=session_id, query=user_message, limit=lim)
+            if recalled:
+                sections.append("\n".join(f"- {x}" for x in recalled))
+        if not sections:
             return base
-        block = "<!-- Vector Memory Matches -->\n\n" + "\n\n".join(f"- {x}" for x in recalled)
+        block = "<!-- Vector Memory Matches -->\n\n" + "\n\n".join(sections)
         return f"{base}\n\n{block}"
 
     async def _manual_agent(self, user_message: str, session_id: str) -> str:

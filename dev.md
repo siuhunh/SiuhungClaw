@@ -1,9 +1,9 @@
 # AceClaw Python 重构需求与后端设计
 
-> 版本：0.7  
+> 版本：0.8  
 > 状态：进行中  
 > 后端：**FastAPI + Uvicorn（Async HTTP + SSE）**  
-> Agent 引擎：**LangChain 1.0+**  
+> Agent 引擎：**LangChain 1.0+**（`create_agent` + 工具循环回退）  
 > 语言：**Python 3.11+**
 
 ---
@@ -13,16 +13,17 @@
 本阶段目标是用 Python 重构并实现 OpenClaw 基础能力，先完成可运行的后端内核，覆盖：
 
 - 异步 HTTP API（FastAPI）
-- SSE 流式推送（逐步输出 Agent 执行事件）
-- LangChain 1.0 Agent 运行时骨架
-- 文本文件记忆（Markdown/JSON）
-- Skill 扫描与管理
+- SSE 流式推送（在整轮 Agent 完成后按词片增量输出，见 §3.2）
+- LangChain 1.0 Agent 运行时（工具调用；`create_agent` 不可用时回退手写多步 `bind_tools` 循环）
+- 会话记忆：`*.md` 全文 transcript、`*.json` 结构化消息、周期性 **LLM 长期要点抽取**（`memory_extraction`）、可选 **`{session_id}_longterm.md` 镜像**
+- Skill 扫描与管理（`skill_manager` + System Prompt 内联注入）
+- 可选 **Milvus 会话向量记忆**（与 RAG 知识库分离）；本地 **LlamaIndex + BM25** 知识检索（`search_knowledge_base`）
 
 非本阶段重点（后续迭代）：
 
 - 完整前端 IDE
 - 复杂多 Agent 编排
-- 向量数据库与重型 RAG 管线
+- 生产级多租户、分布式追踪与配额治理
 
 ---
 
@@ -32,19 +33,20 @@
 
 - Web：`FastAPI`
 - ASGI Server：`Uvicorn`
-- Agent：`LangChain 1.0+`（先以可替换的 runtime 接口落地）
-- LLM 服务：**DeepSeek 优先**（OpenAI 兼容接入）
-- Embedding（RAG）：**本地 Ollama 可选**，未配置时回退 DeepSeek
-- 数据存储：本地文件系统（`backend/storage`，见 §4）
+- Agent：`LangChain 1.0+`（`backend/app/services/agent_runtime.py`：`create_agent` 优先，异常时回退 `_manual_agent`，单轮最多 24 步工具调用）
+- LLM 服务：**DeepSeek 优先**（OpenAI 兼容接入；`temperature` 见 `config.toml` / `[llm]`）
+- Embedding：**RAG 知识库** 与 **Milvus 会话记忆** 共用 `build_embedding_model`（Ollama 条件启用或 OpenAI 兼容接口；见 `model_factory`）
+- 数据存储：本地文件系统（`backend/storage`，见 §4）；System Prompt 片段在 `backend/workspace/`（与 Shell 沙箱 `storage/workspace` 分离）
 - 传输协议：JSON over HTTP + `text/event-stream`（SSE）
 
 ### 2.2 分层
 
 - `api`：路由层，负责参数校验与响应协议
-- `services`：业务层（agent、memory、skills）
+- `services`：业务层（`agent_runtime`、`memory_store`、`memory_extraction`、`skill_manager`、`system_prompt`、`vector_memory`、`storage_files`）
 - `schemas`：Pydantic 请求/响应模型
-- `core`：配置、应用初始化
-- `storage`：运行期文件（`skill/`、`memory/`）
+- `core`：配置（`config.py`）、模型工厂（`model_factory.py`）、逻辑路径解析（`storage_paths.py`）
+- `tools`：核心工具构建（`bootstrap.py` 及各 `*_tool.py`）
+- `storage`：运行期业务文件（`skill/`、`memory/`、`workspace/`、`knowledge/`、`index/`）
 
 ### 2.3 本地存储根目录（统一约定）
 
@@ -68,18 +70,17 @@
 - `POST /api/skills/reload`：重载 skills 缓存
 - `GET /api/memories`：记忆文件列表；带 `?path=memory/xxx.md` 或 `memory/xxx.json` 时读取单文件全文
 - `POST /api/memories`：按路径保存记忆文件
-- `GET /api/sessions`：会话列表（按 `updated_at` 降序，数据来自 `storage/session`）
+- `GET /api/sessions`：会话列表（按 `updated_at` 降序，数据来自 `storage/memory/*.json`，见 §3.7）
 - `POST /api/chat`：对话；请求体字段 `stream` 为 `true` 时 **SSE 流式**，为 `false` 时 **JSON 同步**（不再单独提供 `/api/chat/stream`）
 
 ### 3.2 SSE 事件协议
 
-建议使用以下事件类型：
+`POST /api/chat` 且 `stream: true` 时，当前实现固定发送以下事件（`backend/app/api/routes/chat.py`）：
 
-- `start`：请求开始
-- `token`：增量文本片段
-- `memory_saved`：记忆写入完成
-- `end`：请求结束
-- `error`：异常
+- `start`：携带 `session_id`
+- `token`：增量文本片段（**注意**：Agent 与工具整轮执行结束后，再将最终答复按空格分片流式输出，**不是**模型 token 级实时流）
+- `memory_saved`：`MemoryStore.append_turn` 落盘完成后触发
+- `end`：携带最终 `output` 全文
 
 数据格式：
 
@@ -88,44 +89,48 @@ event: token
 data: {"content":"..."}
 ```
 
-### 3.3 文件记忆
+（如需 `error` 事件或真·流式 LLM，可在后续迭代扩展。）
+
+### 3.3 文件记忆与会话向量写入
 
 记忆目录约定（物理路径，对应 API 逻辑路径前缀 `memory/`）：
 
-- `backend/storage/memory/{session_id}.md`：可读对话历史（主，追加块）
-- `backend/storage/memory/{session_id}.json`：结构化消息列表（与 `append_turn` 同步）
+- `backend/storage/memory/{session_id}.md`：人类可读对话全文（按轮追加 `user` / `assistant` 块）
+- `backend/storage/memory/{session_id}.json`：结构化消息列表、`updated_at`，以及长期记忆字段 `long_term.bullets`（字符串数组）、`long_term.last_extracted_at` 等
+- `backend/storage/memory/{session_id}_longterm.md`：长期要点列表的 Markdown 镜像（便于人工查看；与 JSON 内 bullets 同步）
 
-策略：
+策略（`memory_store.MemoryStore.append_turn`，在每次 `POST /api/chat` 得到完整助手回复后调用）：
 
-- 每轮对话落盘（追加 md + 更新 json）
-- `session_id` 作为会话主键
-- API 中文件以逻辑路径表示，例如 `memory/main_session.md`
+1. 追加 `*.md`，在 `*.json` 的 `messages` 中追加本轮 user / assistant 消息（带 UTC ISO 时间戳）。
+2. **长期要点抽取**（可配置）：当 `memory.long_term_enabled` 为真且 `long_term_every_n_user_turns > 0` 时，每累计 N 个 **user** 轮次，取最近 `extraction_context_messages` 条消息拼成上下文，调用 `memory_extraction.extract_long_term_bullets`（独立一次 LLM 调用，输出 JSON 字符串数组），经 `merge_bullets` 去重、截断至 `max_long_term_bullets`，写回 JSON 并刷新 `_longterm.md`。
+3. 若 Milvus 已连接（§3.11）：每轮写入 **short** 类向量（整轮 user+assistant 文本）；每条**新**长期要点额外写入 **long** 类向量。
+
+`session_id` 作为会话主键。API 中文件以逻辑路径表示，例如 `memory/main_session.md`、`memory/main_session.json`。
+
+`GET /api/memories` 无 `path` 时返回的每条记录包含：`session_id`、`path_md`、`path_json`、`path_longterm_md`、`updated_at`（由相关文件 mtime 推导）。
 
 ### 3.4 Skill 管理
 
 技能文件约定（物理路径，对应 API 逻辑路径前缀 `skill/`）：
 
-- 每次启动agent会自动调用available_skills()函数读取所有/backend/storage/skill/{SKILL}.md，根据名字+功能说明在汇总为backend/workspace/SKILLS_SNAPSHOT.md，参考如下：
+- 每个技能对应 `backend/storage/skill/` 下**顶层**一个 Markdown：`*.md`。
+- 列表元数据中的 `name` 为**文件名去掉扩展名**（`foo.md` → `foo`）；`path` 为相对 `storage/` 的逻辑路径（如 `skill/foo.md`）；`location` 为磁盘绝对路径。
+- **描述摘要**（`description`）：取文件全文**第一行非空且不以 `#` 开头的行**（因此常见写法是 `# 标题` → `## 小节` → 一段纯文字说明，该纯文字行即成为描述）。
 
-```plaintext
+System Prompt 组装时（`system_prompt._auto_skills_block`），在 `SKILLS_SNAPSHOT.md` 的 `{{AUTO_SKILLS}}` 位置注入 Markdown 列表，形态如下（示意）：
+
+```markdown
 <available_skills>
-  <skill>
-    <name>宝可梦冠军属性技能克制表</name>
-    <description>这个技能可以帮助你在游玩宝可梦冠军时计算属性技能克制信息</description>
-    <location>./backend/storage/skill/pokemon_dmg_skill.md</location>
-  </skill>
+- **pokemon_dmg_skill** (`skill/pokemon_dmg_skill.md`): 这个技能可以帮助你在游玩宝可梦冠军时计算属性技能克制信息
+- **nyc_subway_platform_schedule_skill** (`skill/nyc_subway_platform_schedule_skill.md`): …
 </available_skills>
 ```
 
-- 每个技能对应 `backend/storage/skill/` 下**顶层**一个 Markdown：`*.md`
-- 技能标识 `name` 为文件名去掉扩展名（例如 `greeting.md` → `greeting`）
-- API 中路径示例：`skill/greeting.md`
-
 读取规则：
 
-- **服务启动时**扫描 `backend/storage/skill/*.md` 并载入缓存
-- 支持运行中通过 `POST /api/skills` 写入后自动 `reload`，或 `POST /api/skills/reload`
-- 列表接口返回：技能名、逻辑路径 `path`、绝对路径 `location`、描述摘要
+- **服务启动时** `skill_manager.reload()` 扫描 `backend/storage/skill/*.md` 并载入缓存（`main.py` startup）。
+- `POST /api/skills` 保存成功后**自动** `reload()`；亦可调用 `POST /api/skills/reload` 仅刷新缓存。
+- `GET /api/skills` 返回：`name`、`path`、`location`、`description`。
 
 ### 3.5 模型接入与回退策略（新增）
 
@@ -146,6 +151,7 @@ data: {"content":"..."}
   - `openai`（及别名 `gpt`、`openai_compatible`）→ `langchain_openai.ChatOpenAI`
   - `ollama` → `langchain_ollama.ChatOllama`
 - **回退**：`model_type` 无法识别时，直接使用 `ChatDeepSeek`；若按映射构建实例时抛错（依赖、参数、网络校验等），`try/except` 后**回退为 `ChatDeepSeek`**
+- **温度**：`llm.temperature`（`config.toml` 或环境变量覆盖合并逻辑见 `get_settings()`）
 
 #### 3.5.3 Embedding 策略（知识库 / RAG）
 
@@ -159,6 +165,19 @@ data: {"content":"..."}
 
 - 示例文件：`backend/config.toml.example`
 - 推荐本地使用方式：复制为 `backend/config.toml` 后填写 `llm.api_key`
+
+#### 3.5.5 记忆子系统（`[memory]`）
+
+`config.toml` 的 `[memory]` 段（及对应环境变量前缀 `MEMORY_*`，见 `config._from_env()`）控制：
+
+| 配置项 | 含义 |
+|--------|------|
+| `short_term_messages` | 注入 System Prompt 的最近结构化消息条数上限（`user`/`assistant` 各计一条） |
+| `long_term_enabled` | 是否启用周期性长期要点抽取 |
+| `long_term_every_n_user_turns` | 每 N 个 user 轮触发抽取；`0` 关闭周期触发 |
+| `extraction_context_messages` | 传给抽取模型的上下文消息条数 |
+| `max_long_term_bullets` | 长期要点列表最大条数（超出丢弃最旧） |
+| `vector_recall_long_k` / `vector_recall_short_k` | Milvus 已启用且集合含 `memory_kind` 时，从向量库分别召回 long / short 的最大条数（见 §3.11） |
 
 ### 3.6 启动配置与日志（新增）
 
@@ -192,9 +211,11 @@ data: {"content":"..."}
 ```bash
 python backend/app/main.py --reload --env-dir ./backend --log-path ./backend/logs/ace_claw.log
 ```
-### 3.7 会话管理
+### 3.7 会话列表
 
-在storage/session/目录下，根据session_id关联对应的{session_id}.json会话记录，同时暴露给/api/sessions的GET. POST使用。
+- **数据源**：`backend/storage/memory/` 下的 `*.json`（排除 `*_longterm` 等后缀）；与 §3.3 会话主文件一致，**不存在**单独的 `storage/session/` 目录。
+- **接口**：仅 `GET /api/sessions`，返回 `{ "sessions": [...] }`，每条为 `memory_store.list_memory_files()` 的一行（含 `session_id`、各逻辑路径、`updated_at` 降序）。
+- **写入**：会话内容随 `POST /api/chat` 由 `MemoryStore.append_turn` 创建/更新；无单独「创建会话」API。
 
 ### 3.8 前端设计
 
@@ -220,9 +241,9 @@ python backend/app/main.py --reload --env-dir ./backend --log-path ./backend/log
 
 - **功能描述**：允许 Agent 在受限的安全环境下执行 Shell 命令
 
-- **实现逻辑**：直接使用 LangChain 内置工具 `langchain_community.tools.ShellTool`
+- **实现逻辑**：`langchain_community.tools.ShellTool`，外包一层黑名单校验（`terminal_tool.py`）。
 
-- **配置要求**：初始化配置 `root_dir` 限制操作范围（沙箱化），防止修改系统关键文件；预置黑名单拦截高危指令（如 `rm -rf /`和 `shutdown`）
+- **配置要求**：`root_dir` 固定为 **`backend/storage/workspace`**（`WORKSPACE_DIR`），防止越权写系统目录；正则黑名单拦截高危片段（如 `rm -rf /`、`shutdown`、`dd if=` 等）。
 
 - **工具名称**：terminal
 
@@ -230,91 +251,94 @@ python backend/app/main.py --reload --env-dir ./backend --log-path ./backend/log
 
 - **功能描述**：赋予 Agent 逻辑计算、数据处理和脚本执行的能力
 
-- **实现逻辑**：直接使用 LangChain 内置工具 `langchain_experimental.tools.PythonREPLTool`
+- **实现逻辑**：底层为 `langchain_experimental.tools.PythonREPLTool`，经 **`StructuredTool`** 包装以兼容新版 Agent 调用签名（`python_repl_tool.py`）。
 
-- **配置要求**：自动创建临时 Python 交互环境，需确保 experimental 包依赖安装正确
+- **配置要求**：需安装 `langchain-experimental`；REPL **无**独立文件系统沙箱，勿用于执行危险代码路径。
 
 - **工具名称**：python_repl
 
 #### 3.9.3  Fetch 网络信息获取
 
-- **功能描述**：用于获取指定 URL 的网页内容，是 Agent 联网的核心工具
+- **功能描述**：获取 URL 内容或（可选）联网搜索。
 
-- **实现逻辑**：直接使用 LangChain 内置工具 `langchain_community.tools.RequestsGetTool`，同时支持env环境配置文件配置tavily的user_key，如果有配置tavily key则优先使用并统计查询次数和查询token数。
+- **实现逻辑**（`fetch_url_tool.py`）：对 http(s) 使用 `RequestsGetTool`；若响应像 HTML，则用 **BeautifulSoup + html2text** 转为 Markdown（过长截断约 16k）；**JSON 等非 HTML** 原样返回（过长同样截断）。若配置了 **`TAVILY_API_KEY`** 且输入**不是** URL，则走 **Tavily**；调用写入 `ace_claw` 日志，并由 **`GET /api/usage`** 汇总 token 估算。
 
-- **增强配置**：原生工具返回原始 HTML，Token 消耗巨大，需封装 Wrapper，通过 BeautifulSoup 或 html2text 库清洗数据，仅返回 Markdown 或纯文本内容
-
-- **工具名称**：fetch_url，配置tavily
+- **工具名称**：`fetch_url`
 
 #### 3.9.4  文件读取工具 (File Reader)
 
 - **功能描述**：精准读取本地指定文件内容，是 Agent Skills 机制的核心依赖，用于读取 SKILL.md 详细说明
 
-- **实现逻辑**：直接使用 LangChain 内置工具 `langchain_community.tools.file_management.ReadFileTool`
+- **实现逻辑**：`langchain_community.tools.file_management.ReadFileTool`
 
-- **配置要求**：设置 `root_dir` 为项目根目录，严禁读取项目以外的系统文件
+- **配置要求**：`root_dir` 为 **`backend/`**（`BASE_DIR`）；传入相对路径如 `storage/skill/foo.md`、`storage/memory/x.md`。路径仍受宿主 OS 权限约束，勿依赖其跨仓库隔离。
 
 - **工具名称**：read_file
 
 #### 3.9.5  RAG 检索工具 (Hybrid Retrieval)
 
-- **功能描述**：用户询问具体知识库内容（非对话历史）时，Agent 可调用此工具进行深度检索
+- **功能描述**：用户询问 **知识库**（非对话历史、非 `memory/` 文件）时，由 Agent 调用；与 `read_file`（读 `storage/skill`、`storage/memory` 逻辑路径）互补。
 
-- **技术选型**：LlamaIndex
+- **技术选型**：优先 **LlamaIndex**（`SimpleDirectoryReader` + 向量索引持久化到 `storage/index/knowledge/`）；向量嵌入使用 **OpenAI 兼容** `OpenAIEmbedding`（`settings.llm.api_key` + `embedding.model` 或默认 `text-embedding-3-small` + `embedding.base_url` / `llm.base_url`）。
 
-- **实现逻辑**：支持扫描指定目录（如 `knowledge/`）下的 PDF/MD/TXT 文件构建本地索引；实现 Hybrid Search（关键词检索 BM25 + 向量检索 Vector Search）；索引文件持久化存储至本地 `storage/` 目录
+- **实现逻辑**（`knowledge_tool.py`）：
+  - 若 LlamaIndex 依赖齐全且存在可加载文档、嵌入初始化成功：构建 **向量检索 + BM25Retriever** 的 `QueryFusionRetriever`（失败则退化为单向量 `query_engine`）。
+  - 否则：对 `storage/knowledge/` 下递归收集的 **`.md` / `.txt`** 做 **BM25Okapi** 关键词检索（不索引 PDF；PDF 需走 LlamaIndex 成功分支时由 `SimpleDirectoryReader` 加载）。
+- **工具名称**：`search_knowledge_base`
 
-- **工具名称**：search_knowledge_base
 ---
 
-### 3.9 System Prompt
+### 3.10 System Prompt
 
-Agent 每次被调用时都会重新读取所有 Markdown 文件并组装 System Prompt，确保 workspace 文件的实时编辑能立即生效：
+`build_system_prompt(session_id)` 在**每次** Agent 调用时从磁盘重新读取并拼接（`backend/app/services/system_prompt.py`），顺序固定如下；块之间以 `\n\n` 分隔。
 
 ```Plain Text
 
-┌───────────────────────────────────┐
-│ <!-- Skills Snapshot -->          │  ← `backend/workspace/SKILLS_SNAPSHOT.md`（含 `{{AUTO_SKILLS}}` 注入扫描技能）
-│ <!-- Soul -->                     │  ← `backend/workspace/SOUL.md` (核心设定)
-│ <!-- Identity -->                 │  ← `backend/workspace/IDENTITY.md` (自我认知)
-│ <!-- User Profile -->             │  ← `backend/workspace/USER.md` (用户画像)
-│ <!-- Agents Guide -->             │  ← `backend/workspace/AGENTS.md` (行为准则 & 记忆操作指南)
-│ <!-- Long-term Memory -->         │  ← `storage/memory/{session_id}.md`（当前会话长期记忆；无文件时用占位说明）
-└───────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ SKILLS_SNAPSHOT.md（含 {{AUTO_SKILLS}} → 注入 §3.4 列表）   │  ← backend/workspace/
+│ SOUL.md / IDENTITY.md / USER.md / AGENTS.md               │  ← 缺失时用占位说明
+│ <!-- Long-term Memory (extracted) -->                     │  ← JSON long_term.bullets 或 *_longterm.md
+│ <!-- Short-term Memory (recent window) -->                │  ← 最近结构化消息窗口（§3.5.5）
+│ <!-- Session archival note -->                            │  ← 提示完整 transcript 在 memory/*.md（不注入正文）
+└────────────────────────────────────────────────────────────┘
 ```
 
-每个组件间以 \n\n 分隔，每个组件带 HTML 注释标签便于调试定位。
+可选：若 Milvus 可用且在 `agent_runtime` 中完成召回，则在上述整体后再追加 `<!-- Vector Memory Matches -->` 区块（见 §3.11）。
 
-### 3.10 向量记忆（可选外部数据库）
+### 3.11 向量记忆（可选 Milvus，会话域）
 
-- 配置位置：`config.toml` 的 `[vectordb]` 或 `.env`（Milvus 相关变量）。
-- 启用条件：`vectordb.enabled=true`（或 `VECTOR_DB_ENABLED=true`）且 provider 为 `milvus`。
-- 启动行为：服务启动时尝试初始化 Milvus（集合默认 `aceclaw_memory`）；初始化失败时自动降级为仅本地 md/json 记忆，不阻断服务。
-- 对话写入：每轮对话在写入 `storage/memory/{session_id}.md/.json` 后，按配置可同步写入向量库。
-- 对话召回：Agent 每次响应前可按 `session_id + 用户问题` 在向量库中检索 Top-K 相似记忆，并附加到 System Prompt 的 `<!-- Vector Memory Matches -->` 区块。
+- **配置**：`config.toml` 的 `[vectordb]` 与 `.env`（`VECTOR_DB_ENABLED`、`MILVUS_URI` / `MILVUS_HOST`、`MILVUS_PORT`、`MILVUS_COLLECTION_NAME`、`VECTOR_MEMORY_TOP_K` → `top_k`、`MILVUS_EMBEDDING_DIM`、`MILVUS_METRIC_TYPE` 等）。
+- **启用条件**：`vectordb.enabled=true` 且 `provider=milvus`；`main.py` 启动时 `init_vector_memory`。
+- **集合 schema**：
+  - **新建集合**：包含 `memory_kind`（`short` = 整轮对话摘要向量，`long` = 单条长期要点），检索时可分路召回。
+  - **已存在旧集合**（无 `memory_kind` 字段）：启动日志告警，插入/检索走**兼容模式**（不按 long/short 分流；`vector_recall_*` 行为合并为单次 `search`）。
+- **失败策略**：`pymilvus` 缺失、连接/建表失败时，`get_vector_memory()` 返回的对象保持 `enabled` 逻辑为假或不可连接，**不阻断**服务；仅文件记忆仍可用。
+- **写入**：见 §3.3（`remember_turn` / `remember_long_fact`）。
+- **召回**：`AgentRuntime._build_prompt_with_vector_memory` 在用户消息上检索，将命中列表附加在 System Prompt 末尾（支持 long/short 分栏或 legacy 单列）。
 
 ## 4. 目录与模块规划（已落地）
 
 ```text
 backend/
-  workspace/          # §3.9 System Prompt：SKILLS_SNAPSHOT / SOUL / IDENTITY / USER / AGENTS（每次请求重读）
+  workspace/          # §3.10 System Prompt：SKILLS_SNAPSHOT / SOUL / IDENTITY / USER / AGENTS（每次请求重读）
   app/
-    api/routes/       # health, chat, skills, memories, sessions
+    api/routes/       # health, chat, skills, memories, sessions, usage
     core/             # config, model_factory, storage_paths
     schemas/
-    services/         # agent_runtime, system_prompt, memory_store, skill_manager, storage_files
+    services/         # agent_runtime, system_prompt, memory_store, memory_extraction,
+                      # skill_manager, vector_memory, storage_files
     main.py
   tools/              # §3.9 Core Tools：terminal, python_repl, fetch_url, read_file, search_knowledge_base
   storage/
     skill/            # *.md，API: skill/<name>.md
-    memory/           # *.md / *.json，API: memory/<session_id>.md|json
+    memory/           # *.md / *.json / *_longterm.md，API: memory/<session_id>.md|json
     workspace/        # ShellTool 终端沙箱（与上列 `backend/workspace/` 不同）
-    knowledge/        # RAG 源文档（PDF/MD/TXT）
+    knowledge/        # RAG 源文档（MD/TXT；PDF 依赖 LlamaIndex 分支）
     index/knowledge/  # LlamaIndex 持久化索引
   requirements.txt
   README.md
 
-frontend/             # Next.js 14 App Router，见 §3.7
+frontend/             # Next.js 14 App Router，见 §3.8
   app/                # layout, page, globals.css
   components/         # app-shell, monaco-editor-panel
   lib/                # api 客户端、SSE 解析、cn()
@@ -334,16 +358,16 @@ frontend/             # Next.js 14 App Router，见 §3.7
 - SSE 流式输出骨架
 - 文件记忆与技能扫描服务
 
-### Milestone 2
+### Milestone 2（部分已完成）
 
-- 接入真实 LangChain ChatModel（DeepSeek / OpenAI 兼容）
-- 增加 Embedding Provider 选择与回退（Ollama -> DeepSeek）
-- 统一事件追踪（JSONL trace）
-- 增强 memory（摘要、窗口、检索）
+- 接入真实 LangChain ChatModel（DeepSeek / OpenAI 兼容 / Ollama）与温度配置
+- Embedding Provider 选择与回退（Ollama 条件启用 ↔ OpenAI 兼容）
+- **已完成**：增强 memory（短期窗口注入、周期性长期抽取、可选 Milvus 向量写入/召回）
+- 待办：统一事件追踪（JSONL trace）、更细粒度 SSE（工具事件 / 错误帧 / LLM token 流）
 
 ### Milestone 3
 
-- 加入工具执行与安全策略
+- 工具执行策略扩展（配额、审计、更多内置工具）
 - 前端联调（会话与流式渲染）
 
 ---
@@ -389,11 +413,11 @@ npm run dev
 | GET  | `/api/usage`         | 聚合用量；当前含 `tavily` 字段（未配置 Key 时 `configured=false`）；Tavily 调用仍写 `ace_claw` 日志 |
 | POST | `/api/chat`          | 见 §7.3                                                                    |
 | GET  | `/api/skills`        | 无 `path`：技能列表；有 `path=skill/xxx.md`：返回该文件 `content`                       |
-| POST | `/api/skills`        | 请求体 `{"path": "skill/xxx.md", "content": "..."}` 保存并刷新缓存                  |
+| POST | `/api/skills`        | 请求体 `{"path": "skill/xxx.md", "content": "..."}` 保存并 `reload()`；响应 `{"path","status":"saved"}` |
 | POST | `/api/skills/reload` | 仅重载缓存                                                                     |
-| GET  | `/api/memories`      | 无 `path`：记忆条目列表；有 `path=memory/xxx.md` 或 `memory/xxx.json`：返回文件 `content` |
-| POST | `/api/memories`      | 请求体 `{"path": "memory/...", "content": "..."}`                            |
-| GET  | `/api/sessions`      | 会话列表（按 `updated_at` 降序）                                                   |
+| GET  | `/api/memories`      | 无 `path`：返回 `{ "memories": [...] }`（每会话一行，字段见 §3.3）；有 `path`：返回该文件 `content`（`memory/*.md` / `*.json`） |
+| POST | `/api/memories`      | 请求体 `{"path": "memory/...", "content": "..."}` 保存；**不**自动重载 skill 缓存                            |
+| GET  | `/api/sessions`      | `{ "sessions": [...] }`，数据同源 `GET /api/memories` 列表（§3.7）                                                   |
 
 
 ### 7.3 `POST /api/chat`
@@ -415,5 +439,5 @@ npm run dev
 
 - 服务可启动且 `GET /health` 正常。
 - `POST /api/chat` 在 `stream` 为 `true` / `false` 时分别对应 SSE 与 JSON。
-- `GET/POST /api/skills`、`GET/POST /api/memories`、`GET /api/sessions` 行为与上表一致；磁盘文件位于 `backend/storage/skill/*`、`backend/storage/memory/*`。
+- `GET/POST /api/skills`、`GET/POST /api/memories`、`GET /api/sessions` 行为与上表一致；磁盘文件位于 `backend/storage/skill/*`、`backend/storage/memory/*`（含可选 `*_longterm.md`）。
 
